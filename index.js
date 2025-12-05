@@ -139,7 +139,9 @@ function extractData(text) {
         orderId: text.match(/Order ID:\s*([A-Z0-9]+)/i)?.[1] || null,
         accountOf: text.match(/In Account of\s*(.*?)\s*(?:Transaction|Nov|Dec|Jan)/i)?.[1]?.trim() || null,
         transactionCount: text.match(/Transaction Count #(\d+)/i)?.[1] || null,
-        fromUpi: text.match(/From\s*([A-Za-z0-9@.]+)/i)?.[1] || null,
+        // OLD: fromUpi: text.match(/From\s*([A-Za-z0-9@.]+)/i)?.[1] || null,
+        // NEW: Capture everything (.*?) until "In Account of"
+        fromUpi: text.match(/From\s*(.*?)\s*In Account of/i)?.[1]?.trim() || null,
 
         // Matches: "Nov 26, 2025, 10:31 AM"
         // Explanation: [A-Z][a-z]{2} matches "Nov", \d{1,2} matches "26", etc.
