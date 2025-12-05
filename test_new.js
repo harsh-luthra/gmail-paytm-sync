@@ -3,9 +3,11 @@ const axios = require("axios");
 const { google } = require("googleapis");
 
 const API_URL = "https://kite-pay-api-v1.onrender.com/paytm/payment-sync";
-const TIMESTAMP_API_URL = "https://kite-pay-api-v1.onrender.com/paytm/last-timestamp"; 
+const TIMESTAMP_API_URL = "https://kite-pay-api-v1.onrender.com/paytm/last-timestamp";
+const UPDATE_TIMESTAMP_API_URL = "https://kite-pay-api-v1.onrender.com/paytm/update-last-timestamp";
 const LABEL_NAME = "PROCESSED"; 
 const POLLING_INTERVAL_MS = 30000; // 30 Seconds
+const MAIL_INTERVAL_MS = 4000; // 4 Seconds
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -27,23 +29,60 @@ async function getInitialServerTimestamp() {
     try {
         console.log("Initializing: Fetching last timestamp from server...");
         const response = await axios.get(TIMESTAMP_API_URL);
-        const timeString = response.data?.last_mail_timestamp;
+        const timeData = response.data?.last_mail_timestamp;
 
-        if (!timeString) {
+        if (!timeData) {
             console.log("No timestamp from server. Defaulting to 24h ago.");
             return Math.floor(Date.now() / 1000) - 86400; 
         }
 
-        const dateObj = new Date(timeString);
+        console.log(`Server raw response: ${timeData}`);
+
+        // CHECK 1: Is it already a Number (Unix Timestamp)?
+        // (Checks if input is only digits)
+        if (!isNaN(timeData)) {
+            const timestamp = Number(timeData);
+            
+            // Heuristic: Unix Seconds are usually 10 digits (e.g. 1764633600)
+            // Unix Milliseconds are 13 digits (e.g. 1764633600000)
+            
+            if (timestamp > 9999999999) {
+                // It is Milliseconds -> Convert to Seconds
+                return Math.floor(timestamp / 1000);
+            } else {
+                // It is ALREADY Seconds -> Return as is
+                return timestamp;
+            }
+        }
+
+        // CHECK 2: It is a Date String (e.g., "Sun, 30 Nov...")
+        const dateObj = new Date(timeData);
         if (isNaN(dateObj.getTime())) {
+            console.log("Invalid date format. Defaulting to 24h ago.");
             return Math.floor(Date.now() / 1000) - 86400;
         }
 
-        console.log(`Server last processed: ${timeString}`);
+        // Convert Date Object to Seconds
         return Math.floor(dateObj.getTime() / 1000);
+
     } catch (error) {
-        console.error("Initialization Failed (Server might be down). Defaulting to 3days ago.");
-        return Math.floor(Date.now() / 1000) - 259200; 
+        console.error("Initialization Failed (Server might be down). Defaulting to 1h ago.");
+        return Math.floor(Date.now() / 1000) - 3600; 
+    }
+}
+
+async function updateServerTimestamp(timestamp) {
+    try {
+        // We convert the numeric timestamp to a string or keep it number 
+        // depending on what your backend expects. Sending JSON is standard.
+        await axios.post(UPDATE_TIMESTAMP_API_URL, {
+            last_mail_timestamp: timestamp
+        });
+        console.log(`[Sync] Server timestamp updated to: ${timestamp}`);
+    } catch (error) {
+        console.error(`[Sync] Failed to update server timestamp: ${error.message}`);
+        // We don't throw error here because we don't want to stop the polling loop 
+        // just because the update failed.
     }
 }
 
@@ -101,6 +140,10 @@ function extractData(text) {
         accountOf: text.match(/In Account of\s*(.*?)\s*(?:Transaction|Nov|Dec|Jan)/i)?.[1]?.trim() || null,
         transactionCount: text.match(/Transaction Count #(\d+)/i)?.[1] || null,
         fromUpi: text.match(/From\s*([A-Za-z0-9@.]+)/i)?.[1] || null,
+
+        // Matches: "Nov 26, 2025, 10:31 AM"
+        // Explanation: [A-Z][a-z]{2} matches "Nov", \d{1,2} matches "26", etc.
+        datetimeString: text.match(/([A-Z][a-z]{2}\s\d{1,2},\s\d{4},\s\d{1,2}:\d{2}\s[APM]{2})/)?.[1] || null
     };
 }
 
@@ -118,22 +161,22 @@ async function markAsProcessed(gmail, msgId, labelId) {
 async function processEmails(auth, currentCursorTime) {
     const gmail = google.gmail({ version: "v1", auth });
     const processedLabelId = await getOrCreateLabelId(gmail);
+    let maxInternalTimeInBatch = currentCursorTime; 
 
-    // Track the newest email time found in THIS batch
-    let maxTimeInBatch = currentCursorTime; 
-
-    // Query using the local cursor
     const res = await gmail.users.messages.list({
         userId: "me",
         q: `from:no-reply@paytm.com after:${currentCursorTime} -label:${LABEL_NAME}`, 
     });
 
     const messages = res.data.messages || [];
-
     if (messages.length === 0) {
         console.log("No new emails found.");
-        return maxTimeInBatch; // Return original time (no change)
+        return maxInternalTimeInBatch; 
     }
+
+    // --- FIX: REVERSE ORDER (Oldest First -> Newest Last) ---
+    messages.reverse(); 
+    // --------------------------------------------------------
 
     console.log(`Found ${messages.length} new emails...`);
 
@@ -145,46 +188,78 @@ async function processEmails(auth, currentCursorTime) {
                 format: "full",
             });
 
-            // 1. Get Internal Date (Unix MS) for updating our cursor
+            // 1. TIMESTAMPS FOR SYNCING
             const internalDateMs = parseInt(mail.data.internalDate);
             const internalDateSec = Math.floor(internalDateMs / 1000);
-
-            // 2. Get Header Date (String) for API Payload
             const headers = mail.data.payload.headers;
             const dateHeader = headers.find(h => h.name === "Date")?.value;
 
+            // 2. PARSE BODY
             let encodedBody = mail.data.payload.body.data;
-            if (!encodedBody) { encodedBody = findHtmlBody(mail.data.payload.parts); }
+            if (!encodedBody) encodedBody = findHtmlBody(mail.data.payload.parts);
 
             if (!encodedBody) {
                 console.log(`[${message.id}] Body missing. Marking processed.`);
                 await markAsProcessed(gmail, message.id, processedLabelId);
-                // Even if body missing, we processed it, so update cursor if it's newer
-                if (internalDateSec > maxTimeInBatch) maxTimeInBatch = internalDateSec;
+                if (internalDateSec > maxInternalTimeInBatch) maxInternalTimeInBatch = internalDateSec;
                 continue;
             }
 
             const cleanText = cleanHtmlText(encodedBody);
             const extracted = extractData(cleanText);
 
-            const unixTimestamp = Math.floor(new Date(dateHeader).getTime() / 1000);
+            // 3. PARSE TRANSACTION TIME (From Body)
+            let txnTimestamp = null;
+            if (extracted.datetimeString) {
+                // Input: "Nov 26, 2025, 10:31 AM"
+                // We add " GMT+0530" to force India Standard Time
+                const fullDateStr = extracted.datetimeString + " GMT+0530";
+                const txnDateObj = new Date(fullDateStr);
+                
+                if (!isNaN(txnDateObj.getTime())) {
+                    txnTimestamp = Math.floor(txnDateObj.getTime() / 1000);
+                }
+            }
 
-            const finalData = { ...extracted, timestamp: dateHeader, unixtimestamp: unixTimestamp };
+            // 4. PREPARE API TIMESTAMP (From Header - for syncing logic)
+            let emailHeaderTimestamp = internalDateSec; 
+            if (dateHeader) {
+                const parsedHeaderTime = Math.floor(new Date(dateHeader).getTime() / 1000);
+                if (!isNaN(parsedHeaderTime)) emailHeaderTimestamp = parsedHeaderTime;
+            }
+
+            // 5. CONSTRUCT FINAL PAYLOAD
+            const finalData = { 
+                amount: extracted.amount,
+                orderId: extracted.orderId,
+                accountOf: extracted.accountOf,
+                fromUpi: extracted.fromUpi,
+                
+                // "timestamp" = The Email Date (Used for your internal server syncing)
+                timestamp: emailHeaderTimestamp,
+                
+                // "txn_time" = The Actual Payment Date (From body text)
+                txn_time: txnTimestamp || emailHeaderTimestamp // Fallback to email time if body parse fails
+            };
 
             if (finalData.amount) {
-                console.log(`[${message.id}] Sending ₹${finalData.amount} to API...`);
+                console.log(`[${message.id}] ₹${finalData.amount} | Email Time: ${finalData.timestamp} | Txn Time: ${finalData.txn_time}`);
+                
                 await axios.post(API_URL, finalData);
                 await markAsProcessed(gmail, message.id, processedLabelId);
                 
-                // SUCCESS: Update our local max time if this email is newer
-                if (internalDateSec > maxTimeInBatch) {
-                    maxTimeInBatch = internalDateSec;
+                if (internalDateSec > maxInternalTimeInBatch) {
+                    maxInternalTimeInBatch = internalDateSec;
                 }
+
+                // --- 2. ADD WAIT HERE (Throttle) ---
+                // Wait MAIL_INTERVAL_MS seconds before touching the next email
+                await sleep(MAIL_INTERVAL_MS);
+
             } else {
-                console.log(`[${message.id}] Amount parse fail. Marking processed.`);
+                console.log(`[${message.id}] Amount parse fail.`);
                 await markAsProcessed(gmail, message.id, processedLabelId);
-                // Still update time to avoid re-fetching
-                if (internalDateSec > maxTimeInBatch) maxTimeInBatch = internalDateSec;
+                if (internalDateSec > maxInternalTimeInBatch) maxInternalTimeInBatch = internalDateSec;
             }
 
         } catch (err) {
@@ -192,7 +267,7 @@ async function processEmails(auth, currentCursorTime) {
         }
     }
 
-    return maxTimeInBatch; // Return the new newest time
+    return maxInternalTimeInBatch; 
 }
 
 // --- POLLING LOOP ---
@@ -201,6 +276,8 @@ async function startPolling() {
 
     // 1. Get Start Time from API (ONCE)
     let localCursorTime = await getInitialServerTimestamp();
+    let lastSavedTime = localCursorTime; // Track what we last sent to server
+
     console.log(`Starting loop with timestamp: ${localCursorTime}`);
 
     while (true) {
@@ -212,12 +289,19 @@ async function startPolling() {
 
             // 3. Update local cursor if we moved forward
             if (newTime > localCursorTime) {
-                console.log(`Updating local timestamp from ${localCursorTime} -> ${newTime}`);
+                console.log(`Local timestamp advanced: ${localCursorTime} -> ${newTime}`);
                 localCursorTime = newTime;
             }
 
         } catch (error) {
             console.error("Critical Error in Loop:", error.message);
+        }
+
+        // --- NEW: UPDATE SERVER IF TIME CHANGED ---
+        if (localCursorTime > lastSavedTime) {
+            console.log("New emails were processed. Syncing timestamp to server...");
+            await updateServerTimestamp(localCursorTime);
+            lastSavedTime = localCursorTime; // Update our tracker
         }
 
         console.log(`Waiting ${POLLING_INTERVAL_MS / 1000}s...`);
