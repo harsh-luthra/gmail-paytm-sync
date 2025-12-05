@@ -1,0 +1,16 @@
+{
+  "name": "gmail-paytm-sync",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "axios": "^1.13.2",
+    "googleapis": "^166.0.0",
+    "node-cron": "^4.2.1"
+  }
+}
