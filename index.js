@@ -12,6 +12,30 @@ const MAIL_INTERVAL_MS = 4000;     // 4 Seconds wait between emails (Throttle)
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const express = require('express');
+const cors = require('cors');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// --- MIDDLEWARE ---
+// Allows the server to accept JSON data (like your payment sync script sends)
+app.use(express.json());
+// Allows requests from other domains (e.g., your frontend)
+app.use(cors());
+
+// --- ROUTES ---
+
+// 1. Health Check (GET request)
+app.get('/', (req, res) => {
+    res.send({ status: 'Online', message: 'Server is running successfully!' });
+});
+
+// --- START SERVER ---
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+});
+
 async function authorize() {
     try {
         const credentials = JSON.parse(fs.readFileSync("credentials.json"));
