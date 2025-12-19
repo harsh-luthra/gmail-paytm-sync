@@ -254,7 +254,8 @@ async function processEmails(auth, currentCursorTime) {
 
             if (finalData.amount) {
                 console.log(`[${message.id}] Processing ₹${finalData.amount} | ID: ${finalData.orderId}`);
-                
+
+                console.log("Final Data:", finalData);
                 // --- STEP A: SEND TO API ---
                 await axios.post(API_URL, finalData);
                 
