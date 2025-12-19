@@ -179,14 +179,13 @@ function extractData(text) {
     };
 }
 
-// --- 4. CORE PROCESSING LOOP ---
+// --- 4. CORE PROCESSING LOOP (UPDATED) ---
 
 async function processEmails(auth, currentCursorTime) {
     const gmail = google.gmail({ version: "v1", auth });
     const processedLabelId = await getOrCreateLabelId(gmail);
     let maxInternalTimeInBatch = currentCursorTime; 
 
-    // Fetch emails newer than our cursor
     const res = await gmail.users.messages.list({
         userId: "me",
         q: `from:no-reply@paytm.com after:${currentCursorTime} -label:${LABEL_NAME}`, 
@@ -198,8 +197,7 @@ async function processEmails(auth, currentCursorTime) {
         return maxInternalTimeInBatch; 
     }
 
-    // Process Oldest -> Newest (So if we crash, we resume from the specific failed time)
-    messages.reverse(); 
+    messages.reverse(); // Process Oldest -> Newest
 
     console.log(`Found ${messages.length} new emails. Processing...`);
 
@@ -211,18 +209,15 @@ async function processEmails(auth, currentCursorTime) {
                 format: "full",
             });
 
-            // 1. Get Email Timestamp (Internal Date)
             const internalDateMs = parseInt(mail.data.internalDate);
             const internalDateSec = Math.floor(internalDateMs / 1000);
             
-            // 2. Parse Body
             let encodedBody = mail.data.payload.body.data;
             if (!encodedBody) encodedBody = findHtmlBody(mail.data.payload.parts);
 
             if (!encodedBody) {
                 console.log(`[${message.id}] Body missing. Marking processed (skip).`);
                 await markAsProcessed(gmail, message.id, processedLabelId);
-                // Safe to advance cursor because this is a data error, not a network error
                 if (internalDateSec > maxInternalTimeInBatch) maxInternalTimeInBatch = internalDateSec;
                 continue;
             }
@@ -230,60 +225,56 @@ async function processEmails(auth, currentCursorTime) {
             const cleanText = cleanHtmlText(encodedBody);
             const extracted = extractData(cleanText);
 
-            // 3. Parse Transaction Time (from body text)
             let txnTimestamp = null;
             if (extracted.datetimeString) {
-                const fullDateStr = extracted.datetimeString + " GMT+0530"; // Force IST
+                const fullDateStr = extracted.datetimeString + " GMT+0530";
                 const txnDateObj = new Date(fullDateStr);
-                if (!isNaN(txnDateObj.getTime())) {
-                    txnTimestamp = Math.floor(txnDateObj.getTime() / 1000);
-                }
+                if (!isNaN(txnDateObj.getTime())) txnTimestamp = Math.floor(txnDateObj.getTime() / 1000);
             }
 
-            // Fallback for timestamp
-            const finalTimestamp = txnTimestamp || internalDateSec;
+            // --- DATA CLEANING & VALIDATION ---
+            
+            // 1. Remove commas from amount (if exists)
+            const cleanAmount = extracted.amount ? extracted.amount.replace(/,/g, '') : null;
 
             const finalData = { 
-                amount: extracted.amount,
+                amount: cleanAmount,
                 orderId: extracted.orderId,
                 accountOf: extracted.accountOf,
                 fromUpi: extracted.fromUpi,
-                timestamp: internalDateSec, // The email receive time
-                txn_time: finalTimestamp    // The actual payment time
+                timestamp: internalDateSec,
+                txn_time: txnTimestamp || internalDateSec
             };
 
-            if (finalData.amount) {
-                console.log(`[${message.id}] Processing ₹${finalData.amount} | ID: ${finalData.orderId}`);
-
-                console.log("Final Data:", finalData);
-                // --- STEP A: SEND TO API ---
+            // 2. CHECK: Must have Amount AND OrderId AND AccountOf
+            if (finalData.amount && finalData.orderId && finalData.accountOf) {
+                
+                console.log(`[${message.id}] Sending: ₹${finalData.amount} | ID: ${finalData.orderId}`);
+                
+                // --- Send to API ---
                 await axios.post(API_URL, finalData);
                 
-                // --- STEP B: MARK PROCESSED (Only if Step A succeeds) ---
+                // --- Mark Processed ---
                 await markAsProcessed(gmail, message.id, processedLabelId);
                 
-                // --- STEP C: UPDATE CURSOR ---
-                if (internalDateSec > maxInternalTimeInBatch) {
-                    maxInternalTimeInBatch = internalDateSec;
-                }
-
-                // Throttle
+                if (internalDateSec > maxInternalTimeInBatch) maxInternalTimeInBatch = internalDateSec;
                 await sleep(MAIL_INTERVAL_MS);
 
             } else {
-                console.log(`[${message.id}] Failed to parse amount. Marking processed to skip.`);
+                // 3. Skip Condition: Missing Data
+                console.log(`[${message.id}] SKIPPED: Missing required fields (Amount/ID/AccountOf).`);
+                console.log(`Debug Data: Amount=${finalData.amount}, OrderId=${finalData.orderId}, Account=${finalData.accountOf}`);
+                
+                // Mark processed so we don't look at it again
                 await markAsProcessed(gmail, message.id, processedLabelId);
+                
+                // Still update cursor so we don't get stuck in the past
                 if (internalDateSec > maxInternalTimeInBatch) maxInternalTimeInBatch = internalDateSec;
             }
 
         } catch (err) {
-            console.error(`[${message.id}] CRITICAL ERROR (Network/API): ${err.message}`);
-            
-            // !!! SAFETY BREAK !!!
-            // We stop the loop immediately. 
-            // We do NOT update maxInternalTimeInBatch.
-            // On the next poll, we will fetch this exact same email again and retry.
-            break; 
+            console.error(`[${message.id}] NETWORK/API ERROR: ${err.message}`);
+            break; // Stop loop on network error to retry later
         }
     }
 
