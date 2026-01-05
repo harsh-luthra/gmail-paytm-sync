@@ -2,6 +2,41 @@ const fs = require("fs");
 const readline = require("readline");
 const { google } = require("googleapis");
 
+const express = require('express');
+const cors = require('cors');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// --- MIDDLEWARE ---
+// Allows the server to accept JSON data (like your payment sync script sends)
+app.use(express.json());
+// Allows requests from other domains (e.g., your frontend)
+app.use(cors());
+
+// --- ROUTES ---
+
+// 1. Health Check (GET request)
+app.get('/', (req, res) => {
+    res.send({ status: 'Online', message: 'Server is running successfully!' });
+});
+
+// --- START SERVER ---
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+});
+
+app.get('/oauth2callback', async (req, res) => {
+  const code = req.query.code;
+
+  const { tokens } = await oAuth2Client.getToken(code);
+  oAuth2Client.setCredentials(tokens);
+
+  require('fs').writeFileSync('token.json', JSON.stringify(tokens, null, 2));
+  res.send('OAuth successful. You can close this tab.');
+});
+// --- AUTHORIZATION SETUP ---
+
 // Load client secrets
 const credentials = JSON.parse(fs.readFileSync("credentials.json"));
 const { client_secret, client_id, redirect_uris } = credentials.installed;

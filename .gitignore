@@ -1,0 +1,5 @@
+# Ignore all token.json files
+**/token.json
+
+# Ignore all credentials.json files
+**/credentials.json
