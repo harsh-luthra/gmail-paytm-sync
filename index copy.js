@@ -4,13 +4,17 @@ const { google } = require("googleapis");
 
 const path = require('path');
 
-const CREDS_BASE_DIR = path.join(__dirname, 'creds');
+const CREDS_BASE_DIR = path.join(__dirname, 'creds_');
 
 // Auto-detect companies from folder names
 const COMPANIES = fs.readdirSync(CREDS_BASE_DIR)
   .filter(name =>
     fs.statSync(path.join(CREDS_BASE_DIR, name)).isDirectory()
   );
+
+console.log("CREDS_BASE_DIR:", CREDS_BASE_DIR);
+console.log("COMPANIES:", COMPANIES);
+
 
 // --- CONFIGURATION ---
 const API_URL = "https://kite-pay-api-v1.onrender.com/paytm/payment-sync";
