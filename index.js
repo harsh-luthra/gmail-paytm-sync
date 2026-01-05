@@ -230,9 +230,14 @@ async function processEmails(company, auth, currentCursorTime) {
     let maxInternalTimeInBatch = currentCursorTime;
 
     // Fetch emails
+    // const res = await gmail.users.messages.list({
+    //     userId: "me",
+    //     q: `from:no-reply@paytm.com after:${currentCursorTime} -label:${LABEL_NAME}`,
+    // });
+
     const res = await gmail.users.messages.list({
         userId: "me",
-        q: `from:no-reply@paytm.com after:${currentCursorTime} -label:${LABEL_NAME}`,
+        q: `from:no-reply@paytm.com after:${currentCursorTime} -label:${LABEL_NAME} -subject:"has failed"`,
     });
 
     const messages = res.data.messages || [];
