@@ -2,17 +2,6 @@ const fs = require("fs");
 const axios = require("axios");
 const { google } = require("googleapis");
 
-const path = require('path');
-
-const CREDS_BASE_DIR = path.join(__dirname, 'creds');
-
-// Auto-detect companies from folder names
-const COMPANIES = fs.readdirSync(CREDS_BASE_DIR)
-  .filter(name =>
-    fs.statSync(path.join(CREDS_BASE_DIR, name)).isDirectory()
-  );
-
-// --- CONFIGURATION ---
 const API_URL = "https://kite-pay-api-v1.onrender.com/paytm/payment-sync";
 const TIMESTAMP_API_URL = "https://kite-pay-api-v1.onrender.com/paytm/last-timestamp-company";
 const UPDATE_TIMESTAMP_API_URL = "https://kite-pay-api-v1.onrender.com/paytm/update-last-timestamp-company";
@@ -46,46 +35,21 @@ app.listen(PORT, () => {
     console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
 
-async function authorizeCompany(company) {
-  try {
-    const basePath = path.join(CREDS_BASE_DIR, company);
-
-    const credentials = JSON.parse(
-      fs.readFileSync(path.join(basePath, 'credentials.json'))
-    );
-
-    const tokenPath = path.join(basePath, 'token.json');
-
+async function authorize() {
+    const credentials = JSON.parse(fs.readFileSync("credentials.json"));
     const { client_secret, client_id, redirect_uris } = credentials.installed;
+    const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
 
-    const oAuth2Client = new google.auth.OAuth2(
-      client_id,
-      client_secret,
-      redirect_uris[0]
-    );
-
-    if (!fs.existsSync(tokenPath)) {
-      console.error(`[${company}] ❌ token.json missing`);
-      return null;
+    if (fs.existsSync("token.json")) {
+        oAuth2Client.setCredentials(JSON.parse(fs.readFileSync("token.json")));
+        return oAuth2Client;
     }
-
-    oAuth2Client.setCredentials(
-      JSON.parse(fs.readFileSync(tokenPath))
-    );
-
-    console.log(`[${company}] ✅ Authorized`);
-    return oAuth2Client;
-
-  } catch (err) {
-    console.error(`[${company}] ❌ Authorization error: ${err.message}`);
-    return null;
-  }
+    console.log("Token missing. Run local auth script first.");
+    process.exit(1);
 }
 
-
-// --- 1. STATE MANAGEMENT (Server Timestamp) ---
-
-async function getInitialServerTimestamp(company) {
+// --- 1. INITIAL FETCH (Only called once at startup) ---
+async function getInitialServerTimestamp() {
     try {
         console.log(`[${company}] Initializing: Fetching last timestamp from server...`);
         const response = await axios.get(TIMESTAMP_API_URL, {
@@ -115,7 +79,7 @@ async function getInitialServerTimestamp(company) {
         // CHECK 2: Is it a Date String?
         const dateObj = new Date(timeData);
         if (isNaN(dateObj.getTime())) {
-            console.log(`[${company}] Invalid date format from server. Defaulting to 24h ago.`);
+            console.log("Invalid date format. Defaulting to 24h ago.");
             return Math.floor(Date.now() / 1000) - 86400;
         }
 
@@ -127,25 +91,20 @@ async function getInitialServerTimestamp(company) {
     }
 }
 
-async function updateServerTimestamp(timestamp, company) {
-  try {
-    await axios.post(UPDATE_TIMESTAMP_API_URL, {
-      last_mail_timestamp: timestamp,
-      company              // 🔥 IMPORTANT
-    });
-
-    console.log(
-      `[${company}] [Sync] Server timestamp updated to: ${timestamp}`
-    );
-  } catch (error) {
-    console.error(
-      `[${company}] [Sync] Failed to update server timestamp: ${error.message}`
-    );
-  }
+async function updateServerTimestamp(timestamp) {
+    try {
+        // We convert the numeric timestamp to a string or keep it number 
+        // depending on what your backend expects. Sending JSON is standard.
+        await axios.post(UPDATE_TIMESTAMP_API_URL, {
+            last_mail_timestamp: timestamp
+        });
+        console.log(`[Sync] Server timestamp updated to: ${timestamp}`);
+    } catch (error) {
+        console.error(`[Sync] Failed to update server timestamp: ${error.message}`);
+        // We don't throw error here because we don't want to stop the polling loop 
+        // just because the update failed.
+    }
 }
-
-
-// --- 2. GMAIL UTILITIES ---
 
 async function getOrCreateLabelId(gmail) {
     const res = await gmail.users.labels.list({ userId: "me" });
@@ -163,15 +122,6 @@ async function getOrCreateLabelId(gmail) {
         },
     });
     return newLabel.data.id;
-}
-
-async function markAsProcessed(gmail, msgId, labelId, company) {
-    await gmail.users.messages.modify({
-        userId: "me",
-        id: msgId,
-        requestBody: { addLabelIds: [labelId] }
-    });
-    console.log(`[${company}] [${msgId}] Labeled as processed.`);
 }
 
 function findHtmlBody(parts) {
@@ -218,10 +168,18 @@ function extractData(text) {
     };
 }
 
-// --- 4. CORE PROCESSING LOOP (UPDATED) ---
+async function markAsProcessed(gmail, msgId, labelId) {
+    await gmail.users.messages.modify({
+        userId: "me",
+        id: msgId,
+        requestBody: { addLabelIds: [labelId] }
+    });
+    console.log(`[${msgId}] Labeled as processed.`);
+}
 
-// --- Process emails for a single company, fully sequential ---
-async function processEmails(company, auth, currentCursorTime) {
+// --- CORE PROCESSING ---
+// Now accepts 'currentCursor' and returns the 'newCursor'
+async function processEmails(auth, currentCursorTime) {
     const gmail = google.gmail({ version: "v1", auth });
     const processedLabelId = await getOrCreateLabelId(gmail);
     let maxInternalTimeInBatch = currentCursorTime;
@@ -238,10 +196,12 @@ async function processEmails(company, auth, currentCursorTime) {
         return maxInternalTimeInBatch;
     }
 
-    messages.reverse(); // Oldest → Newest
-    console.log(`[${company}] Found ${messages.length} new emails.`);
+    // --- FIX: REVERSE ORDER (Oldest First -> Newest Last) ---
+    messages.reverse(); 
+    // --------------------------------------------------------
 
-    // Process each message sequentially
+    console.log(`Found ${messages.length} new emails...`);
+
     for (const message of messages) {
         try {
             const mail = await gmail.users.messages.get({
@@ -252,14 +212,17 @@ async function processEmails(company, auth, currentCursorTime) {
 
             const internalDateMs = parseInt(mail.data.internalDate);
             const internalDateSec = Math.floor(internalDateMs / 1000);
+            const headers = mail.data.payload.headers;
+            const dateHeader = headers.find(h => h.name === "Date")?.value;
 
+            // 2. PARSE BODY
             let encodedBody = mail.data.payload.body.data;
             if (!encodedBody) encodedBody = findHtmlBody(mail.data.payload.parts);
 
             if (!encodedBody) {
-                console.log(`[${company}] [${message.id}] Body missing. Marking processed.`);
-                await markAsProcessed(gmail, message.id, processedLabelId, company);
-                maxInternalTimeInBatch = Math.max(maxInternalTimeInBatch, internalDateSec);
+                console.log(`[${message.id}] Body missing. Marking processed.`);
+                await markAsProcessed(gmail, message.id, processedLabelId);
+                if (internalDateSec > maxInternalTimeInBatch) maxInternalTimeInBatch = internalDateSec;
                 continue;
             }
 
@@ -270,91 +233,98 @@ async function processEmails(company, auth, currentCursorTime) {
             if (extracted.datetimeString) {
                 const fullDateStr = extracted.datetimeString + " GMT+0530";
                 const txnDateObj = new Date(fullDateStr);
-                if (!isNaN(txnDateObj.getTime())) txnTimestamp = Math.floor(txnDateObj.getTime() / 1000);
+                
+                if (!isNaN(txnDateObj.getTime())) {
+                    txnTimestamp = Math.floor(txnDateObj.getTime() / 1000);
+                }
             }
 
-            const cleanAmount = extracted.amount ? extracted.amount.replace(/,/g, '') : null;
+            // 4. PREPARE API TIMESTAMP (From Header - for syncing logic)
+            let emailHeaderTimestamp = internalDateSec; 
+            if (dateHeader) {
+                const parsedHeaderTime = Math.floor(new Date(dateHeader).getTime() / 1000);
+                if (!isNaN(parsedHeaderTime)) emailHeaderTimestamp = parsedHeaderTime;
+            }
 
-            const finalData = {
-                amount: cleanAmount,
+            // 5. CONSTRUCT FINAL PAYLOAD
+            const finalData = { 
+                amount: extracted.amount,
                 orderId: extracted.orderId,
                 accountOf: extracted.accountOf,
                 fromUpi: extracted.fromUpi,
-                timestamp: internalDateSec,
-                txn_time: txnTimestamp || internalDateSec,
-                company // optional, for your API logs
+                
+                // "timestamp" = The Email Date (Used for your internal server syncing)
+                timestamp: emailHeaderTimestamp,
+                
+                // "txn_time" = The Actual Payment Date (From body text)
+                txn_time: txnTimestamp || emailHeaderTimestamp // Fallback to email time if body parse fails
             };
 
-            if (finalData.amount && finalData.orderId && finalData.accountOf) {
-                console.log(`[${company}] [${message.id}] Sending: ₹${finalData.amount} | ID: ${finalData.orderId}`);
-
-                // --- Sequential API call ---
+            if (finalData.amount) {
+                console.log(`[${message.id}] ₹${finalData.amount} | Email Time: ${finalData.timestamp} | Txn Time: ${finalData.txn_time}`);
+                
                 await axios.post(API_URL, finalData);
+                await markAsProcessed(gmail, message.id, processedLabelId);
+                
+                if (internalDateSec > maxInternalTimeInBatch) {
+                    maxInternalTimeInBatch = internalDateSec;
+                }
 
-                // Mark as processed only after API succeeds
-                await markAsProcessed(gmail, message.id, processedLabelId, company);
-
-                maxInternalTimeInBatch = Math.max(maxInternalTimeInBatch, internalDateSec);
-
-                // Optional throttle
+                // --- 2. ADD WAIT HERE (Throttle) ---
+                // Wait MAIL_INTERVAL_MS seconds before touching the next email
                 await sleep(MAIL_INTERVAL_MS);
 
             } else {
-                console.log(`[${company}] [${message.id}] SKIPPED: Missing required fields`);
-                await markAsProcessed(gmail, message.id, processedLabelId, company);
-                maxInternalTimeInBatch = Math.max(maxInternalTimeInBatch, internalDateSec);
+                console.log(`[${message.id}] Amount parse fail.`);
+                await markAsProcessed(gmail, message.id, processedLabelId);
+                if (internalDateSec > maxInternalTimeInBatch) maxInternalTimeInBatch = internalDateSec;
             }
 
         } catch (err) {
-            console.error(`[${company}] [${message.id}] ERROR: ${err.message}`);
-            break; // stop processing to retry later
+            console.error(`[${message.id}] Failed:`, err.message);
         }
     }
 
     return maxInternalTimeInBatch;
 }
 
-// --- 5. POLLING LOOP ---
+// --- POLLING LOOP ---
+async function startPolling() {
+    const auth = await authorize();
 
-// --- Polling loop for a single company ---
-async function startPollingForCompany(company) {
-    const auth = await authorizeCompany(company);
-    if (!auth) return;
-
-    let localCursorTime = await getInitialServerTimestamp(company);
-    let lastSavedTime = localCursorTime;
+    // 1. Get Start Time from API (ONCE)
+    let localCursorTime = await getInitialServerTimestamp();
+    let lastSavedTime = localCursorTime; // Track what we last sent to server
 
     console.log(`[${company}] ▶️ Starting sync from ${localCursorTime}`);
 
     while (true) {
         try {
-            console.log(`\n[${company}] 🔍 Checking inbox after ${localCursorTime}`);
-            const newTime = await processEmails(company, auth, localCursorTime);
+            console.log(`\n--- Checking Inbox (after: ${localCursorTime}) ---`);
+            
+            // 2. Process and get the updated time
+            const newTime = await processEmails(auth, localCursorTime);
 
+            // 3. Update local cursor if we moved forward
             if (newTime > localCursorTime) {
-                console.log(`[${company}] ⏩ Cursor advanced: ${localCursorTime} → ${newTime}`);
+                console.log(`Local timestamp advanced: ${localCursorTime} -> ${newTime}`);
                 localCursorTime = newTime;
             }
 
-            if (localCursorTime > lastSavedTime) {
-                await updateServerTimestamp(localCursorTime, company);
-                lastSavedTime = localCursorTime;
-            }
-
-        } catch (err) {
-            console.error(`[${company}] ❌ Polling loop error: ${err.message}`);
+        } catch (error) {
+            console.error("Critical Error in Loop:", error.message);
         }
 
+        // --- NEW: UPDATE SERVER IF TIME CHANGED ---
+        if (localCursorTime > lastSavedTime) {
+            console.log("New emails were processed. Syncing timestamp to server...");
+            await updateServerTimestamp(localCursorTime);
+            lastSavedTime = localCursorTime; // Update our tracker
+        }
+
+        console.log(`Waiting ${POLLING_INTERVAL_MS / 1000}s...`);
         await sleep(POLLING_INTERVAL_MS);
     }
 }
 
-// --- Start polling for all companies sequentially with stagger ---
-(async () => {
-    console.log(`🚀 Starting Paytm Gmail Sync for companies:`, COMPANIES);
-
-    for (const company of COMPANIES) {
-        startPollingForCompany(company); // Each company runs independently
-        await sleep(15000); // stagger start by 15s to avoid quota spikes
-    }
-})();
+startPolling();
